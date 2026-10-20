@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { detect, MARKER, TITLEPATCH_MARK } from './patch.mjs';
 
 const t = (v) => (v ? new Date(Number(v)).toISOString().replace('T', ' ').slice(0, 19) : '-');
 const line = (s) => console.log(s);
@@ -32,8 +33,11 @@ if (!bundle) {
   line('补丁状态      : 找不到 zcode.cjs，可这样指定：node status.mjs "<路径>"');
 } else {
   const c = fs.readFileSync(bundle, 'utf8');
-  const patched = c.includes('ZCode 会话标题编辑器') && c.includes('let v=e.optionSpecs.reasoningLevel.values,b=new Set');
-  line('补丁状态      : ' + (patched ? '已应用' : '未应用或版本不符'));
+  const markers = c.split(TITLEPATCH_MARK).length - 1;
+  const S = detect(c);
+  const patched = c.includes(MARKER) && markers === 1 && S;
+  line('补丁状态      : ' + (patched ? '已应用' : c.includes(MARKER) || markers ? '版本不符 / 补丁不完整' : '未应用'));
+  line('结构识别      : ' + (S ? '通过（提示词变量 ' + S.promptVar + '，实现函数 ' + S.fnName + '）' : '失败'));
   line('zcode.cjs     : ' + bundle);
   line('bundle 修改于 : ' + fs.statSync(bundle).mtime.toISOString().replace('T', ' ').slice(0, 19));
 }

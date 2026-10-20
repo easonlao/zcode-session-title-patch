@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /**
- * 在临时副本上做调试插桩（只在分析时用）：
- *   1. FFa 守卫打印判定输入
+ * 调试插桩（只在分析时用）：
+ *   1. 触发守卫打印判定输入
  *   2. openai-compatible 请求体打印 reasoning_effort
- * 用法: node debug-instrument.mjs <target-cjs> [--revert]
+ * 用法: node debug-instrument.mjs <target-cjs>
+ *
+ * 守卫函数名按结构自动识别，ZCode 升级后不用改这里。
  */
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { detect } from './patch.mjs';
 
 const target = process.argv[2];
 if (!target) {
@@ -19,18 +22,22 @@ const MARK2 = 'globalThis.__TDBG_BODY';
 
 let src = fs.readFileSync(target, 'utf8');
 
-// 1) 守卫插桩
-const guardAnchor =
-  'function FFa(e,t,n={}){if(e.config.titleGeneration?.enabled===!1||!e.config.titleGeneration||!e.sessionStore||e.config.parentSessionId||e.config.taskType&&e.config.taskType!=="interactive")return!1;';
+// 1) 守卫插桩：从补丁后的守卫里取函数名与归一化函数名
+const S = detect(src);
+if (!S) {
+  console.error('识别失败：这版 zcode.cjs 的标题代码结构已变化。');
+  process.exit(1);
+}
+const guardAnchor = `function ${S.guardName}(e,t,n={}){if(e.config.titleGeneration?.enabled===!1||!e.config.titleGeneration||!e.sessionStore||e.config.parentSessionId||e.config.taskType&&e.config.taskType!=="interactive")return!1;`;
 if (!src.includes(MARK1) && src.includes(guardAnchor)) {
   src = src.replace(
     guardAnchor,
     guardAnchor +
-      `try{globalThis.__TDBG_GUARD=globalThis.__TDBG_GUARD||[];globalThis.__TDBG_GUARD.push({cfg:!!e.config.titleGeneration,enabled:e.config.titleGeneration?.enabled,store:!!e.sessionStore,parent:!!e.config.parentSessionId,taskType:e.config.taskType,turn:e.turnNumber,bypass:!!n.bypassShortInputGuard,len:String(qSe(t)||"").length})}catch{};` +
+      `try{globalThis.__TDBG_GUARD=globalThis.__TDBG_GUARD||[];globalThis.__TDBG_GUARD.push({cfg:!!e.config.titleGeneration,enabled:e.config.titleGeneration?.enabled,store:!!e.sessionStore,parent:!!e.config.parentSessionId,taskType:e.config.taskType,turn:e.turnNumber,bypass:!!n.bypassShortInputGuard,len:String(${S.normalizer}(t)||"").length})}catch{};` +
       MARK1 +
       ';',
   );
-  console.log('guard instrumented');
+  console.log('guard instrumented (' + S.guardName + ')');
 } else {
   console.log('guard: skipped (already instrumented or anchor missing)');
 }

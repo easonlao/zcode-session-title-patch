@@ -2,23 +2,27 @@
 /**
  * ZCode 会话标题增强补丁（参考 oil-oil/oil-codex-title 的命名规范）
  *
- * 做三件事：
+ * 做四件事：
  *   1. 换掉内置标题生成的系统提示词：类别 emoji + 对象｜目标，含语言与主线稳定性规则
  *   2. 让标题生成在每轮对话后都重新评估（原来是只在第 0 轮跑一次）
  *   3. 把最近几轮对话、原始输入、当前标题、项目名一起交给模型（原来是只给首条输入）
+ *   4. 修正辅助调用的思考档位，避免网关拒收 off/disabled 导致标题静默失败
  *
  * 用法：
  *   node patch.mjs            # 打补丁（幂等）
  *   node patch.mjs --check    # 只看当前状态
- *   node patch.mjs --revert   # 用备份还原
+ *   node patch.mjs --revert   # 还原成打补丁前的备份
  *
  * 注意：ZCode 升级会覆盖 resources/glm/zcode.cjs，升级后重跑一次即可。
- * 补丁只在语法校验通过后才写盘，并保留首次打补丁前的备份。
+ * 补丁只在语法校验通过后才写盘；每次真正打补丁前都会刷新备份。
+ *
+ * 位置识别不依赖压缩后的函数名：脚本按代码结构找目标，函数名变了也能用。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // 换机器时不用改这里：先看 --target，再按常见安装位置逐个找
 const TARGET_CANDIDATES = [
@@ -38,8 +42,9 @@ const target = argValue('--target', null) ?? TARGET_CANDIDATES.find((p) => fs.ex
 const backup = target + '.bak-titlepatch';
 const MARKER = 'ZCode 会话标题编辑器';
 const TITLEPATCH_MARK = '/*titlepatch*/';
+const TITLEPATCH_END = '/*titlepatch-end*/';
 
-// 原始提示词（还原时换回去用）
+// 原始提示词（用于识别原厂写法）
 const ORIGINAL_PROMPT = `Generate a concise title for this coding session.
 
 This is a title-generation task, not a conversation.
@@ -60,28 +65,6 @@ Title rules:
 - Do not use generic titles such as "User Request", "Coding Task", or "Question".
 - Do not use markdown, numbering, quotes, trailing punctuation, or explanations.
 - Return exactly one valid JSON object with no surrounding text: {"title":"..."}`;
-
-// 插到 xFa 开头：决定这次到底要不要真去调模型。
-//   - 手动改过名（custom）：永不覆盖，也不浪费一次调用
-//   - 已有 generated 标题 + 本次输入很短（「继续」「好的」）：跳过，避免每句废话都起一次标题
-//   - 还没正经标题（first_input）：任何消息都补一次
-const TITLE_PATCH_SNIPPET =
-  'if(t.querySource===aAn){' +
-  'let s=null;try{s=await this.sessionStore?.getSession(this.sessionId)}catch{}' +
-  'if(s&&s.titleSource==="custom")return null;' +
-  'if(s&&s.titleSource==="generated"&&Array.from(qSe(e)||"").length<10)return null' +
-  '}' +
-  TITLEPATCH_MARK +
-  ';';
-
-// 辅助调用（标题 / 测试连接 / 网页抓取后处理等）的档位由 auxiliaryModelOptions 决定，
-// 它取的是模型声明档位里的「第一个」——对 deepseek 类模型这个值被重命名成 "off"，
-// 而部分自建 / OpenAI 兼容网关会直接 400 拒收 off/disabled/nothink/adaptive/default/auto。
-// 改成「跳过这些取值、用第一个可用的档位」，跳过失败再退回最高档（一定能用）。
-const AUX_OPTIONS_OLD =
-  'function _P(e){return{reasoningLevel:e.optionSpecs.reasoningLevel.values[0],maxOutputTokens:Math.min(5e3,e.optionSpecs.maxOutputTokens.max)}}';
-const AUX_OPTIONS_NEW =
-  'function _P(e){let v=e.optionSpecs.reasoningLevel.values,b=new Set(["off","disabled","nothink","adaptive","default","auto"]),r=v.find(u=>!b.has(u));return{reasoningLevel:r??v.at(-1),maxOutputTokens:Math.min(5e3,e.optionSpecs.maxOutputTokens.max)}}';
 
 const NEW_PROMPT = `你是 ZCode 会话标题编辑器。只依据输入 JSON 返回 JSON，不调用工具。
 
@@ -120,116 +103,274 @@ const NEW_PROMPT = `你是 ZCode 会话标题编辑器。只依据输入 JSON �
 
 只返回一个 JSON 对象，不要任何其他文本：{"title":"..."}`;
 
-const OLD_TFA =
-  'function TFa(e){return[{role:"system",content:kFa},{role:"user",content:qSe(e)}]}';
+const AUX_BLOCKLIST = '["off","disabled","nothink","adaptive","default","auto"]';
 
-const NEW_TFA =
-  'async function TFa(e,t){' +
-  'let n={};' +
-  'try{n.project=((this.config?.workingDirectory??"").replace(/[\\\\/]+$/,"").split(/[\\\\/]/).pop())||void 0}catch{}' +
-  'try{n.current_title=(await this.sessionStore?.getSession(this.sessionId))?.title||""}catch{}' +
-  'try{' +
-  'let o=await this.sessionStore?.messages({sessionID:this.sessionId})||[],i=[],a=!1;' +
-  'for(let c of o){' +
-  'let u=c.info??{};' +
-  'if(u.role!=="user"&&u.role!=="assistant"||u.synthetic===!0||u.visibility==="model-only")continue;' +
-  'let f="";' +
-  'for(let g of c.parts??[])if(g&&g.type==="text"&&typeof g.text==="string"){f+=g.text;if(f.length>=(u.role==="user"?700:200))break}' +
-  'f=qSe(f);' +
-  'if(!f)continue;' +
-  'if(!a&&u.role==="user"){a=!0;n.original_input=f}' +
-  'i.push({role:u.role,text:f,seq:i.length})' +
-  '}' +
-  // 主线证据来自用户自己说的话；助手输出只作背景，取太多会把标题带偏
-  'let c=i.filter(g=>g.role==="user").slice(-4),u=i.filter(g=>g.role==="assistant").slice(-2);' +
-  'n.recent_turns=[...c,...u].sort((g,_)=>g.seq-_.seq).map(g=>({role:g.role,text:g.text}))' +
-  '}catch{}' +
-  'n.latest_input=qSe(e);' +
-  'return [{role:"system",content:kFa+(t&&t.querySource===$Se?"\\n\\n本次是目标摘要标题任务：只返回简短的持续目标短语（3～8 个词），不加分类 emoji，不加「｜」。":"")},{role:"user",content:JSON.stringify(n)}]}';
+function escRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
-const XFA_HEAD =
-  'async function xFa(e,t){let n=this.config.titleGeneration?.modelSelection??this.getSessionModelSelection();if(!n)return null;';
-const CALLSITE_OLD = 'u=[],f=TFa(e),g=this.createEvent(nt.ModelRequest,';
-const CALLSITE_NEW = 'u=[],f=await TFa.call(this,e,t),g=this.createEvent(nt.ModelRequest,';
-const FFA_OLD =
-  'function FFa(e,t,n={}){if(e.sessionTitleGenerationAttempted||e.config.titleGeneration?.enabled===!1||!e.config.titleGeneration||!e.sessionStore||e.config.parentSessionId||e.config.taskType&&e.config.taskType!=="interactive"||e.turnNumber!==0)return!1;let o=qSe(t);return o.length===0?!1:n.bypassShortInputGuard||Array.from(o).length>=LFa}';
-const FFA_NEW =
-  'function FFa(e,t,n={}){if(e.config.titleGeneration?.enabled===!1||!e.config.titleGeneration||!e.sessionStore||e.config.parentSessionId||e.config.taskType&&e.config.taskType!=="interactive")return!1;return qSe(t).length>0}';
+/**
+ * 按代码结构识别这版 bundle 里标题相关函数的真实名字与位置。
+ * 打补丁前后都能识别，便于幂等执行。
+ */
+function detect(src) {
+  // 1) 提示词：找原文首句（或已打补丁的标记），再取它外面的反引号；
+  //    变量名是反引号前紧挨着的标识符
+  let pi = src.indexOf('Generate a concise title for this coding session.');
+  if (pi === -1) pi = src.indexOf(MARKER);
+  if (pi === -1) return null;
+  const promptOpen = src.lastIndexOf('`', pi);
+  const promptClose = src.indexOf('`', pi);
+  if (promptOpen === -1 || promptClose === -1 || promptClose < pi) return null;
+  const pm = src.slice(Math.max(0, promptOpen - 80), promptOpen).match(/([A-Za-z_$][\w$]*)=$/);
+  if (!pm) return null;
+  const promptVar = pm[1];
 
-// 每一处：old 是原厂写法，new 是补丁后写法；打补丁找 old，还原找 new
-const PATCHES = [
-  {
-    name: '辅助调用档位 (auxiliaryModelOptions)',
-    old: AUX_OPTIONS_OLD,
-    new: AUX_OPTIONS_NEW,
-    locateOld: (src) => anchor(src, AUX_OPTIONS_OLD),
-    locateNew: (src) => anchor(src, AUX_OPTIONS_NEW),
-  },
-  {
-    name: '提示词',
-    old: ORIGINAL_PROMPT,
-    new: NEW_PROMPT,
-    // 提示词是模板字符串，位置随内容变化，按「kFa=` 到下一个反引号」取
-    locateOld: (src) => promptSpan(src, (t) => t.startsWith('Generate a concise title for this coding session.')),
-    locateNew: (src) => promptSpan(src, (t) => t.includes(MARKER)),
-  },
-  {
-    name: '消息构造 (TFa)',
-    old: OLD_TFA,
-    new: NEW_TFA,
-    locateOld: (src) => anchor(src, OLD_TFA),
-    locateNew: (src) => anchor(src, NEW_TFA),
-  },
-  {
-    name: '标题调用跳过规则 (xFa)',
-    old: XFA_HEAD,
-    new: XFA_HEAD + TITLE_PATCH_SNIPPET,
-    // old 是 new 的前缀，所以找 old 时必须确认后面还没有插进去，否则会重复插入
-    locateOld: (src) => {
-      const i = src.indexOf(XFA_HEAD);
-      if (i === -1) return null;
-      if (src.slice(i + XFA_HEAD.length, i + XFA_HEAD.length + TITLE_PATCH_SNIPPET.length) === TITLE_PATCH_SNIPPET) return null;
-      return { from: i, to: i + XFA_HEAD.length, text: XFA_HEAD };
-    },
-    locateNew: (src) => anchor(src, XFA_HEAD + TITLE_PATCH_SNIPPET),
-  },
-  {
-    name: '消息构造调用点 (xFa)',
-    old: CALLSITE_OLD,
-    new: CALLSITE_NEW,
-    locateOld: (src) => anchor(src, CALLSITE_OLD),
-    locateNew: (src) => anchor(src, CALLSITE_NEW),
-  },
-  {
-    name: '触发条件 (FFa)',
-    old: FFA_OLD,
-    new: FFA_NEW,
-    locateOld: (src) => anchor(src, FFA_OLD),
-    locateNew: (src) => anchor(src, FFA_NEW),
-  },
-];
+  // 2) 输入归一化函数：trim + 合并空白 + 截断到固定长度
+  const nm = src.match(
+    /function ([A-Za-z_$][\w$]*)\(e\)\{let t=e\.trim\(\)\.replace\(\/\\s\+\/g," "\);return t\.length>([A-Za-z_$][\w$]*)\?t\.slice\(0,\2\):t\}/,
+  );
+  if (!nm) return null;
+  const normalizer = nm[1];
 
-function promptSpan(src, predicate) {
-  const start = src.indexOf('kFa=`');
-  if (start === -1) return null;
-  const from = start + 5;
-  const end = src.indexOf('`', from);
-  if (end === -1) return null;
-  const text = src.slice(from, end);
-  if (!predicate(text)) return null;
-  return { from, to: end, text };
+  // 3) 标题消息构造函数：原版是同步单行；打过补丁后是 async 多行
+  let builderName = null;
+  let builderOld = null;
+  const bm = src.match(
+    new RegExp(
+      'function ([A-Za-z_$][\\w$]*)\\(e\\)\\{return\\[\\{role:"system",content:(' +
+        escRe(promptVar) +
+        ')\\},\\{role:"user",content:(' +
+        escRe(normalizer) +
+        ')\\(e\\)\\}\\]\\}',
+    ),
+  );
+  if (bm) {
+    builderName = bm[1];
+    builderOld = bm[0];
+  } else {
+    const bmPatched = src.match(/async function ([A-Za-z_$][\w$]*)\(e,t\)\{let n=\{\};try\{n\.project=/);
+    if (!bmPatched) return null;
+    builderName = bmPatched[1];
+  }
+
+  // 4) 调用点：构造消息后紧接着创建 ModelRequest 事件
+  const callOldRe = new RegExp(
+    '([A-Za-z_$][\\w$]*)=\\[\\],([A-Za-z_$][\\w$]*)=' +
+      escRe(builderName) +
+      '\\(e\\),([A-Za-z_$][\\w$]*)=this\\.createEvent\\(([A-Za-z_$][\\w$]*)\\.ModelRequest,',
+  );
+  const callNewRe = new RegExp(
+    '([A-Za-z_$][\\w$]*)=\\[\\],([A-Za-z_$][\\w$]*)=await ' +
+      escRe(builderName) +
+      '\\.call\\(this,e,([A-Za-z_$][\\w$]*)\\),([A-Za-z_$][\\w$]*)=this\\.createEvent\\(([A-Za-z_$][\\w$]*)\\.ModelRequest,',
+  );
+  const cmOld = callOldRe.exec(src);
+  const cmNew = cmOld ? null : callNewRe.exec(src);
+  const cm = cmOld ?? cmNew;
+  if (!cm) return null;
+
+  // 5) 外层函数（标题生成实现）与它的第二个参数名
+  const fnStart = src.lastIndexOf('async function ', cm.index);
+  if (fnStart === -1) return null;
+  const sig = src.slice(fnStart, fnStart + 300).match(/^async function ([A-Za-z_$][\w$]*)\(([^)]*)\)\{/);
+  if (!sig) return null;
+  const params = sig[2].split(',').map((s) => s.trim()).filter(Boolean);
+  if (params.length < 2) return null;
+  const fnName = sig[1];
+  const ctxParam = params[1];
+  const bodyStart = fnStart + sig[0].length;
+
+  // 6) 两个 querySource 常量（同一处声明，位置稳定）
+  const qm = src.match(/([A-Za-z_$][\w$]*)="session_title",([A-Za-z_$][\w$]*)="goal_summary_title"/);
+  if (!qm) return null;
+  const sessionSource = qm[1];
+  const goalSource = qm[2];
+
+  // 7) 辅助调用档位函数
+  const auxOldRe =
+    /function ([A-Za-z_$][\w$]*)\(e\)\{return\{reasoningLevel:e\.optionSpecs\.reasoningLevel\.values\[0\],maxOutputTokens:Math\.min\(5e3,e\.optionSpecs\.maxOutputTokens\.max\)\}\}/;
+  const auxNewRe = new RegExp(
+    'function ([A-Za-z_$][\\w$]*)\\(e\\)\\{let v=e\\.optionSpecs\\.reasoningLevel\\.values,b=new Set\\(' +
+      escRe(AUX_BLOCKLIST) +
+      '\\),r=v\\.find\\(u=>!b\\.has\\(u\\)\\);return\\{reasoningLevel:r\\?\\?v\\.at\\(-1\\),maxOutputTokens:Math\\.min\\(5e3,e\\.optionSpecs\\.maxOutputTokens\\.max\\)\\}\\}',
+  );
+  const amOld = auxOldRe.exec(src);
+  const am = amOld ?? auxNewRe.exec(src);
+  if (!am) return null;
+  const auxName = am[1];
+  const auxOld = amOld
+    ? amOld[0]
+    : `function ${auxName}(e){return{reasoningLevel:e.optionSpecs.reasoningLevel.values[0],maxOutputTokens:Math.min(5e3,e.optionSpecs.maxOutputTokens.max)}}`;
+  const auxNew = `function ${auxName}(e){let v=e.optionSpecs.reasoningLevel.values,b=new Set(${AUX_BLOCKLIST}),r=v.find(u=>!b.has(u));return{reasoningLevel:r??v.at(-1),maxOutputTokens:Math.min(5e3,e.optionSpecs.maxOutputTokens.max)}}`;
+
+  // 8) 触发守卫
+  const guardOldRe = new RegExp(
+    'function ([A-Za-z_$][\\w$]*)\\(e,t,n=\\{\\}\\)\\{if\\(e\\.sessionTitleGenerationAttempted\\|\\|e\\.config\\.titleGeneration\\?\\.enabled===!1\\|\\|!e\\.config\\.titleGeneration\\|\\|!e\\.sessionStore\\|\\|e\\.config\\.parentSessionId\\|\\|e\\.config\\.taskType&&e\\.config\\.taskType!=="interactive"\\|\\|e\\.turnNumber!==0\\)return!1;let ([A-Za-z_$][\\w$]*)=(' +
+      escRe(normalizer) +
+      ')\\(t\\);return \\2\\.length===0\\?!1:n\\.bypassShortInputGuard\\|\\|Array\\.from\\(\\2\\)\\.length>=([A-Za-z_$][\\w$]*)\\}',
+  );
+  const guardNewRe = new RegExp(
+    'function ([A-Za-z_$][\\w$]*)\\(e,t,n=\\{\\}\\)\\{if\\(e\\.config\\.titleGeneration\\?\\.enabled===!1\\|\\|!e\\.config\\.titleGeneration\\|\\|!e\\.sessionStore\\|\\|e\\.config\\.parentSessionId\\|\\|e\\.config\\.taskType&&e\\.config\\.taskType!=="interactive"\\)return!1;return (' +
+      escRe(normalizer) +
+      ')\\(t\\)\\.length>0\\}',
+  );
+  const gmOld = guardOldRe.exec(src);
+  const gm = gmOld ?? guardNewRe.exec(src);
+  if (!gm) return null;
+  const guardName = gm[1];
+  const guardOld = gmOld ? gmOld[0] : null;
+  const guardNew = `function ${guardName}(e,t,n={}){if(e.config.titleGeneration?.enabled===!1||!e.config.titleGeneration||!e.sessionStore||e.config.parentSessionId||e.config.taskType&&e.config.taskType!=="interactive")return!1;return ${normalizer}(t).length>0}`;
+
+  // 9) 构造调用点文本
+  const callsiteOld = `${cm[1]}=[],${cm[2]}=${builderName}(e),${cm[3]}=this.createEvent(${cm[4]}.ModelRequest,`;
+  const callsiteNew = cmOld
+    ? `${cm[1]}=[],${cm[2]}=await ${builderName}.call(this,e,${ctxParam}),${cm[3]}=this.createEvent(${cm[4]}.ModelRequest,`
+    : cm[0];
+
+  return {
+    promptVar,
+    normalizer,
+    builderName,
+    builderOld,
+    builderNew: buildContextBuilder({ builderName, promptVar, normalizer, goalSource }),
+    callsiteOld,
+    callsiteNew,
+    fnName,
+    ctxParam,
+    bodyStart,
+    sessionSource,
+    goalSource,
+    auxOld,
+    auxNew,
+    guardOld,
+    guardNew,
+  };
+}
+
+function buildContextBuilder({ builderName, promptVar, normalizer, goalSource }) {
+  return (
+    `async function ${builderName}(e,t){` +
+    'let n={};' +
+    'try{n.project=String(this.workingDirectory??this.config?.workingDirectory??"").replace(/[\\\\/]+$/,"").split(/[\\\\/]/).pop()||void 0}catch{}' +
+    'try{n.current_title=(await this.sessionStore?.getSession(this.sessionId))?.title||""}catch{}' +
+    'try{' +
+    'let o=await this.sessionStore?.messages({sessionID:this.sessionId})||[],i=[],a=!1;' +
+    'for(let c of o){' +
+    'let u=c.info??{};' +
+    'if(u.role!=="user"&&u.role!=="assistant"||u.synthetic===!0||u.visibility==="model-only")continue;' +
+    'let f="";' +
+    'for(let g of c.parts??[])if(g&&g.type==="text"&&typeof g.text==="string"){f+=g.text;if(f.length>=(u.role==="user"?700:200))break}' +
+    `f=${normalizer}(f);` +
+    'if(!f)continue;' +
+    'if(!a&&u.role==="user"){a=!0;n.original_input=f}' +
+    'i.push({role:u.role,text:f,seq:i.length})' +
+    '}' +
+    // 主线证据来自用户自己说的话；助手输出只作背景，取太多会把标题带偏
+    'let c=i.filter(g=>g.role==="user").slice(-4),u=i.filter(g=>g.role==="assistant").slice(-2);' +
+    'n.recent_turns=[...c,...u].sort((g,_)=>g.seq-_.seq).map(g=>({role:g.role,text:g.text}))' +
+    '}catch{}' +
+    `n.latest_input=${normalizer}(e);` +
+    `return [{role:"system",content:${promptVar}+(t&&t.querySource===${goalSource}?"\\n\\n本次是目标摘要标题任务：只返回简短的持续目标短语（3～8 个词），不加分类 emoji，不加「｜」。":"")},{role:"user",content:JSON.stringify(n)}]}`
+  );
+}
+
+function buildSnippet(S) {
+  return (
+    TITLEPATCH_MARK +
+    `{if(${S.ctxParam}&&${S.ctxParam}.querySource===${S.sessionSource}){` +
+    'let s=null;try{s=await this.sessionStore?.getSession(this.sessionId)}catch{}' +
+    'if(s&&s.titleSource==="custom")return null;' +
+    'if(s&&s.titleSource==="generated"&&Array.from(String(e??"").trim().replace(/\\s+/g," ")).length<10)return null' +
+    '}}' +
+    TITLEPATCH_END
+  );
 }
 
 function anchor(src, text) {
+  if (!text) return null;
   const i = src.indexOf(text);
   if (i === -1) return null;
   return { from: i, to: i + text.length, text };
 }
 
+// 每次都从当前内容重新算函数体起点，避免依赖之前的字符偏移
+function fnBodyStart(src, fnName) {
+  const re = new RegExp('async function ' + escRe(fnName) + '\\(([^)]*)\\)\\{');
+  const m = re.exec(src);
+  return m ? m.index + m[0].length : -1;
+}
+
+function promptSpan(src, needle) {
+  const i = src.indexOf(needle);
+  if (i === -1) return null;
+  const from = src.lastIndexOf('`', i) + 1;
+  const to = src.indexOf('`', i);
+  if (from <= 0 || to < i) return null;
+  return { from, to, text: src.slice(from, to) };
+}
+
+function buildPatches(S) {
+  const snippet = buildSnippet(S);
+  return [
+    {
+      name: '辅助调用档位 (auxiliaryModelOptions)',
+      new: S.auxNew,
+      locateOld: (src) => anchor(src, S.auxOld),
+      locateNew: (src) => anchor(src, S.auxNew),
+    },
+    {
+      name: '提示词',
+      new: NEW_PROMPT,
+      locateOld: (src) => promptSpan(src, 'Generate a concise title for this coding session.'),
+      locateNew: (src) => promptSpan(src, MARKER),
+    },
+    {
+      name: '消息构造 (上下文)',
+      new: S.builderNew,
+      locateOld: (src) => anchor(src, S.builderOld),
+      locateNew: (src) => anchor(src, S.builderNew),
+    },
+    {
+      name: '标题调用跳过规则',
+      new: snippet,
+      // 插在标题实现函数的函数体开头。位置必须在写入时现算：
+      // 前面的替换会改变字符偏移，用 detect 时的 bodyStart 会插错地方。
+      // 已经插过就返回 null，避免重复插入。
+      locateOld: (src) => {
+        const start = fnBodyStart(src, S.fnName);
+        if (start === -1) return null;
+        if (src.slice(start, start + snippet.length) === snippet) return null;
+        return { from: start, to: start, text: '' };
+      },
+      locateNew: (src) => {
+        const start = fnBodyStart(src, S.fnName);
+        if (start === -1) return null;
+        if (src.slice(start, start + snippet.length) !== snippet) return null;
+        return { from: start, to: start + snippet.length, text: snippet };
+      },
+    },
+    {
+      name: '消息构造调用点',
+      new: S.callsiteNew,
+      locateOld: (src) => anchor(src, S.callsiteOld),
+      locateNew: (src) => anchor(src, S.callsiteNew),
+    },
+    {
+      name: '触发条件 (每轮重新评估)',
+      new: S.guardNew,
+      locateOld: (src) => anchor(src, S.guardOld),
+      locateNew: (src) => anchor(src, S.guardNew),
+    },
+  ];
+}
+
 // 打补丁：找原厂写法 -> 换成补丁写法
 function applyTo(content) {
+  const S = detect(content);
+  if (!S) return { content, results: [{ name: '识别标题代码', status: 'anchor-missing' }] };
   const results = [];
-  for (const patch of PATCHES) {
+  for (const patch of buildPatches(S)) {
     const hit = patch.locateOld(content);
     if (!hit) {
       results.push({ name: patch.name, status: patch.locateNew(content) ? 'already' : 'anchor-missing' });
@@ -237,21 +378,6 @@ function applyTo(content) {
     }
     content = content.slice(0, hit.from) + patch.new + content.slice(hit.to);
     results.push({ name: patch.name, status: 'patched' });
-  }
-  return { content, results };
-}
-
-// 还原：找补丁写法 -> 换回原厂写法（这样即使应用升级换了文件，也不会把旧版本文件贴回去）
-function revertFrom(content) {
-  const results = [];
-  for (const patch of PATCHES) {
-    const hit = patch.locateNew(content);
-    if (!hit) {
-      results.push({ name: patch.name, status: patch.locateOld(content) ? 'already-original' : 'anchor-missing' });
-      continue;
-    }
-    content = content.slice(0, hit.from) + patch.old + content.slice(hit.to);
-    results.push({ name: patch.name, status: 'reverted' });
   }
   return { content, results };
 }
@@ -269,7 +395,7 @@ function syntaxOk(file) {
 
 function countMarker(file) {
   const content = fs.readFileSync(file, 'utf8');
-  return content.split(MARKER).length - 1;
+  return content.split(MARKER).length - 1 + content.split(TITLEPATCH_MARK).length - 1;
 }
 
 function state(file) {
@@ -280,78 +406,90 @@ function state(file) {
   return 'patched?' + c;
 }
 
-if (flag('--check')) {
+// 判断是不是被直接执行（被 import 时不要跑 CLI 流程）。
+// 用 realpath 两边归一化：Windows 上用户目录可能是指向其它盘的 junction，
+// argv[1] 和 import.meta.url 的盘符会不一致。
+function samePath(a, b) {
+  try {
+    return fs.realpathSync(a).toLowerCase() === fs.realpathSync(b).toLowerCase();
+  } catch {
+    return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  }
+}
+const invokedDirectly = Boolean(process.argv[1]) && samePath(process.argv[1], fileURLToPath(import.meta.url));
+
+if (invokedDirectly && flag('--check')) {
   console.log('目标文件: ' + target);
   console.log('状态: ' + state(target));
+  if (fs.existsSync(target)) {
+    const S = detect(fs.readFileSync(target, 'utf8'));
+    console.log(
+      '结构识别: ' + (S ? '通过（提示词变量 ' + S.promptVar + '，实现函数 ' + S.fnName + '）' : '失败（这版代码结构已变化）'),
+    );
+  }
   process.exit(0);
 }
 
-if (flag('--revert')) {
+if (invokedDirectly && flag('--revert')) {
   if (!fs.existsSync(target)) {
     console.error('找不到目标文件: ' + target + '（可用 --target 指定）');
     process.exit(1);
   }
   const cur = fs.readFileSync(target, 'utf8');
-  const { content: back, results } = revertFrom(cur);
-  console.log('目标文件: ' + target);
-  for (const r of results) console.log('  ' + r.status.padEnd(20) + r.name);
-  if (results.some((r) => r.status === 'anchor-missing')) {
-    console.error('\n有位置匹配不上，未写入。如果文件已经被更新过，请直接让 ZCode 重新安装/更新一次最省事。');
-    process.exit(2);
-  }
-  if (results.every((r) => r.status === 'already-original')) {
-    console.log('\n本来就是没有补丁的状态，无需改动。');
+  if (!cur.includes(MARKER) && !cur.includes(TITLEPATCH_MARK)) {
+    console.log('当前文件没有补丁痕迹，无需还原。');
     process.exit(0);
   }
-  const tmpR = path.join(os.tmpdir(), 'zcode-title-revert-check.cjs');
-  fs.writeFileSync(tmpR, back, 'utf8');
-  if (!syntaxOk(tmpR)) {
-    console.error('\n还原后的文件未通过语法检查，未写入。');
-    fs.rmSync(tmpR, { force: true });
-    process.exit(3);
+  if (!fs.existsSync(backup)) {
+    console.error('找不到打补丁前的备份: ' + backup + '\n最省事的做法：让 ZCode 重新安装/更新一次。');
+    process.exit(1);
   }
-  fs.rmSync(tmpR, { force: true });
-  fs.writeFileSync(target, back, 'utf8');
-  console.log('\n已还原成 ZCode 原版写法。重启后生效。');
+  const bak = fs.readFileSync(backup, 'utf8');
+  if (bak.includes(MARKER) || bak.includes(TITLEPATCH_MARK)) {
+    console.error('备份本身也带着补丁痕迹，不能用来还原: ' + backup);
+    process.exit(1);
+  }
+  fs.writeFileSync(target, bak, 'utf8');
+  console.log('已还原成打补丁前的版本: ' + backup + ' -> ' + target);
+  console.log('重启 ZCode 后生效。');
   process.exit(0);
 }
 
-if (!fs.existsSync(target)) {
+if (!invokedDirectly) {
+  // 被 verify-title.mjs 等脚本 import 时只导出识别与应用逻辑，不执行 CLI 流程
+} else if (!fs.existsSync(target)) {
   console.error('找不到目标文件: ' + target + '（可用 --target 指定）');
   process.exit(1);
-}
+} else {
+  const original = fs.readFileSync(target, 'utf8');
+  const { content: patched, results } = applyTo(original);
 
-const original = fs.readFileSync(target, 'utf8');
-const { content: patched, results } = applyTo(original);
+  console.log('目标文件: ' + target);
+  for (const r of results) console.log('  ' + r.status.padEnd(20) + r.name);
 
-console.log('目标文件: ' + target);
-for (const r of results) console.log('  ' + r.status.padEnd(20) + r.name);
+  if (results.some((r) => r.status === 'anchor-missing')) {
+    console.error('\n有位置匹配不上：这版 zcode.cjs 的标题生成代码结构可能变了，未写入任何修改。');
+    process.exit(2);
+  }
+  if (results.every((r) => r.status === 'already')) {
+    console.log('\n所有补丁均已应用，无需改动。');
+    process.exit(0);
+  }
 
-if (results.some((r) => r.status === 'anchor-missing')) {
-  console.error('\n有位置匹配不上：这版 zcode.cjs 的标题生成代码可能已经变了，未写入任何修改。');
-  process.exit(2);
-}
-if (results.every((r) => r.status === 'already')) {
-  console.log('\n所有补丁均已应用，无需改动。');
-  process.exit(0);
-}
-
-const wasPristine = !results.some((r) => r.status === 'already');
-
-const tmp = path.join(os.tmpdir(), 'zcode-title-patch-check.cjs');
-fs.writeFileSync(tmp, patched, 'utf8');
-if (!syntaxOk(tmp)) {
-  console.error('\n补丁后的文件未通过 node --check，未写入。');
+  const tmp = path.join(os.tmpdir(), 'zcode-title-patch-check.cjs');
+  fs.writeFileSync(tmp, patched, 'utf8');
+  if (!syntaxOk(tmp)) {
+    console.error('\n补丁后的文件未通过 node --check，未写入。');
+    fs.rmSync(tmp, { force: true });
+    process.exit(3);
+  }
   fs.rmSync(tmp, { force: true });
-  process.exit(3);
-}
-fs.rmSync(tmp, { force: true });
 
-if (wasPristine) {
-  // 这次是在「原厂文件」上打补丁：备份刷成当前这版，保证备份跟应用当前版本一致
-  const refreshed = fs.existsSync(backup);
-  fs.copyFileSync(target, backup);
-  console.log(refreshed ? '已更新备份（应用升级过，旧备份作废）: ' + backup : '已备份原始文件: ' + backup);
+  // 备份 = 本次打补丁前的文件内容；每次真正写入都刷新，避免升级后备份过期
+  fs.writeFileSync(backup, original, 'utf8');
+  fs.writeFileSync(target, patched, 'utf8');
+  console.log('已刷新备份: ' + backup);
+  console.log('\n补丁已写入。重启 ZCode 后生效（当前会话仍用旧代码）。');
 }
-fs.writeFileSync(target, patched, 'utf8');
-console.log('\n补丁已写入。重启 ZCode 后生效（当前会话仍用旧代码）。');
+
+export { detect, applyTo, buildSnippet, buildContextBuilder, NEW_PROMPT, MARKER, TITLEPATCH_MARK };

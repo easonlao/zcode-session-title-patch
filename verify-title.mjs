@@ -1,42 +1,51 @@
 #!/usr/bin/env node
 /**
- * 从补丁后的 zcode.cjs 里抽出真实的 kFa 提示词与 TFa 上下文构造器，
+ * 从补丁后的 zcode.cjs 里抽出真实的标题提示词与上下文构造器，
  * 用真实会话数据跑一遍，再把结果发给模型，检查标题是否符合新规范。
  *
- * 用法: node verify-title.mjs <patched-zcode.cjs> [sessionId]
+ * 用法: node verify-title.mjs <patched-zcode.cjs> [sessionId] [providerId]
+ *
+ * 位置全部按代码结构识别（见 patch.mjs 的 detect），ZCode 升级后压缩名变了也能跑。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { detect, buildSnippet, MARKER } from './patch.mjs';
 
 const bundlePath = process.argv[2];
 const wantSession = process.argv[3];
 if (!bundlePath) {
-  console.error('usage: node verify-title.mjs <patched-zcode.cjs> [sessionId]');
+  console.error('usage: node verify-title.mjs <patched-zcode.cjs> [sessionId] [providerId]');
   process.exit(1);
 }
 
 const src = fs.readFileSync(bundlePath, 'utf8');
+const S = detect(src);
+if (!S) {
+  console.error('识别失败：这版 zcode.cjs 的标题代码结构已变化，先更新 patch.mjs 的识别规则。');
+  process.exit(1);
+}
+console.log('结构: 提示词变量=' + S.promptVar + '  归一化=' + S.normalizer + '  构造器=' + S.builderName + '  实现=' + S.fnName);
 
 // ---- 1. 抽出提示词 ----
-const pStart = src.indexOf('kFa=`');
-const pFrom = pStart + 5;
+const pStart = src.indexOf(S.promptVar + '=`');
+const pFrom = pStart + S.promptVar.length + 2;
 const pEnd = src.indexOf('`', pFrom);
-const kFa = src.slice(pFrom, pEnd);
-console.log('== prompt head ==\n' + kFa.split('\n').slice(0, 3).join('\n'));
-console.log('(prompt length: ' + kFa.length + ' chars)\n');
+const prompt = src.slice(pFrom, pEnd);
+if (!prompt.includes(MARKER)) throw new Error('提示词不是补丁版，请先运行 node patch.mjs');
+console.log('== prompt head ==\n' + prompt.split('\n').slice(0, 3).join('\n'));
+console.log('(prompt length: ' + prompt.length + ' chars)\n');
 
-// ---- 2. 抽出 TFa ----
-const tFrom = src.indexOf('async function TFa(e,t){');
-if (tFrom === -1) throw new Error('patched TFa not found');
+// ---- 2. 抽上下文构造器 ----
+const tFrom = src.indexOf(`async function ${S.builderName}(e,t){`);
+if (tFrom === -1) throw new Error('patched context builder not found');
 const tail = 'content:JSON.stringify(n)}]}';
 const tTail = src.indexOf(tail, tFrom);
-if (tTail === -1) throw new Error('patched TFa tail not found');
-const tEnd = tTail + tail.length;
-const tfaSrc = src.slice(tFrom, tEnd);
-console.log('== TFa extracted (' + tfaSrc.length + ' chars) ==');
-console.log(tfaSrc.slice(0, 240) + ' …\n');
+if (tTail === -1) throw new Error('patched context builder tail not found');
+const builderSrc = src.slice(tFrom, tTail + tail.length);
+console.log('== builder extracted (' + builderSrc.length + ' chars) ==');
+console.log(builderSrc.slice(0, 240) + ' …\n');
 
 // ---- 3. 真实会话数据 ----
 const db = new DatabaseSync(path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite'), { readOnly: true });
@@ -61,23 +70,30 @@ const messages = rawMessages.map((m) => ({ info: JSON.parse(m.data), parts: byMe
 console.log('session: ' + session.id + '  current title: ' + JSON.stringify(session.title) + ' (' + session.title_source + ')');
 console.log('messages in store: ' + messages.length + '\n');
 
-// ---- 4. 执行 bundle 里的 TFa ----
-const qSe = (e) => {
-  const t = String(e ?? '').trim().replace(/\s+/g, ' ');
-  return t.length > 1200 ? t.slice(0, 1200) : t;
-};
-const $Se = 'goal_summary_title';
-const qNo = 1200;
-const WNo = 100;
-const factory = new Function(
-  'kFa',
-  'qSe',
-  '$Se',
-  'qNo',
-  'WNo',
-  'return ' + tfaSrc + '; return TFa;',
+// ---- 4. 执行 bundle 里的构造器 ----
+// 用 bundle 里真实的归一化实现：抽出函数体，把里面引用的截断常量替换成实际值
+const nRe = new RegExp(
+  `function ${S.normalizer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\(e\\)\\{let t=e\\.trim\\(\\)\\.replace\\(\\/\\\\s\\+\\/g," "\\);return t\\.length>([A-Za-z_$][\\w$]*)\\?t\\.slice\\(0,\\1\\):t\\}`,
 );
-const TFa = factory(kFa, qSe, $Se, qNo, WNo);
+const nSrc = nRe.exec(src);
+if (!nSrc) throw new Error('normalizer not found');
+const limitVar = nSrc[1];
+const limitMatch = new RegExp(`${limitVar}=(\\d+)`).exec(src);
+const limitReplacer = limitMatch ? new RegExp(`\\b${limitVar}\\b`, 'g') : null;
+const normalizerSrc = limitReplacer ? nSrc[0].replace(limitReplacer, limitMatch[1]) : nSrc[0];
+const normalizer = new Function('return ' + normalizerSrc + `; return ${S.normalizer};`)();
+console.log('归一化截断长度: ' + (limitMatch ? limitMatch[1] : '未识别（沿用变量）'));
+
+const factory = new Function(
+  'prompt',
+  'normalizer',
+  'goalSource',
+  'return ' + builderSrc.replace(new RegExp('\\b' + S.promptVar + '\\b', 'g'), 'prompt').replace(
+    new RegExp('\\b' + S.normalizer + '\\b', 'g'),
+    'normalizer',
+  ).replace(new RegExp('\\b' + S.goalSource + '\\b', 'g'), 'goalSource') + '; return ' + S.builderName + ';',
+);
+const buildContext = factory(prompt, normalizer, S.goalSource);
 
 let latestInput = '';
 for (let i = messages.length - 1; i >= 0; i--) {
@@ -95,13 +111,13 @@ for (let i = messages.length - 1; i >= 0; i--) {
 
 const fakeThis = {
   sessionId: session.id,
-  config: { workingDirectory: session.directory },
+  workingDirectory: session.directory,
   sessionStore: {
     getSession: async () => ({ title: session.title, titleSource: session.title_source ?? 'first_input' }),
     messages: async () => messages,
   },
 };
-const built = await TFa.call(fakeThis, latestInput, { querySource: 'session_title' });
+const built = await buildContext.call(fakeThis, latestInput, { querySource: 'session_title' });
 const payload = built[1].content;
 console.log('== payload sent to model ==');
 console.log('payload length: ' + payload.length + ' chars, keys: ' + Object.keys(JSON.parse(payload)).join(','));
@@ -110,13 +126,8 @@ console.log('recent_turns: ' + parsedPayload.recent_turns.length + ' entries');
 console.log(payload.length > 1200 ? payload.slice(0, 1200) + ' …' : payload);
 console.log('');
 
-// ---- 5. 辅助调用档位（_P）检查 ----
-const aFrom = src.indexOf('function _P(e){');
-const aTail = 'Math.min(5e3,e.optionSpecs.maxOutputTokens.max)}}';
-const aEnd = src.indexOf(aTail, aFrom) + aTail.length;
-if (aFrom === -1 || aEnd === -1) throw new Error('auxiliaryModelOptions not found in bundle');
-const auxSrc = src.slice(aFrom, aEnd);
-const aux = new Function('return ' + auxSrc + '; return _P;')();
+// ---- 5. 辅助调用档位检查 ----
+const aux = new Function('return ' + S.auxNew + `; return ${S.auxNew.match(/^function ([A-Za-z_$][\w$]*)/)[1]};`)();
 const levelCases = [
   ['off,low,medium,high,max', ['off', 'low', 'medium', 'high', 'max'], 'low'],
   ['disabled,low,high', ['disabled', 'low', 'high'], 'low'],
@@ -124,7 +135,7 @@ const levelCases = [
   ['off,max', ['off', 'max'], 'max'],
   ['off,disabled', ['off', 'disabled'], 'disabled'],
 ];
-console.log('\n== 辅助调用档位 (_P) ==');
+console.log('\n== 辅助调用档位 ==');
 let auxOk = true;
 let chosenLevel = null;
 for (const [label, values, want] of levelCases) {
@@ -138,7 +149,6 @@ for (const [label, values, want] of levelCases) {
 // ---- 6. 真调模型 ----
 const cfgPath = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-// 用哪个 provider 做这次真实调用：命令行第 3 个参数 > 环境变量 > 第一个带 apiKey 的 provider
 const providerArg = [process.argv[4], process.env.ZCODE_TITLE_TEST_PROVIDER].find(Boolean);
 const rules = cfg.config.providerConfigRules.providerRules;
 const providerId = providerArg ?? rules.find((r) => r.config?.access?.apiKey)?.providerId;
@@ -156,7 +166,6 @@ const body = {
     { role: 'user', content: payload },
   ],
   max_tokens: 3000,
-  // 用补丁后 _P 选出的档位真打一次，验证网关接受
   ...(chosenLevel ? { reasoning_effort: chosenLevel } : {}),
 };
 console.log('sending reasoning_effort=' + JSON.stringify(chosenLevel));
@@ -186,54 +195,42 @@ try {
 }
 console.log('\nparsed title: ' + JSON.stringify(title));
 if (title) {
-  const hasSep = title.includes('｜');
-  const emoji = /\p{Extended_Pictographic}/u.test(title);
-  console.log('checks -> 分隔符「｜」: ' + hasSep + ' / 类别 emoji: ' + emoji + ' / 长度: ' + [...title].length);
+  console.log(
+    'checks -> 分隔符「｜」: ' +
+      title.includes('｜') +
+      ' / 类别 emoji: ' +
+      /\p{Extended_Pictographic}/u.test(title) +
+      ' / 长度: ' +
+      [...title].length,
+  );
 }
 
-// ---- 6. 守卫逻辑（触发条件）单测 ----
-const gFrom = src.indexOf('function FFa(e,t,n={}){');
-const gTail = 'return qSe(t).length>0}';
-const gEnd = src.indexOf(gTail, gFrom) + gTail.length;
-const gSrc = src.slice(gFrom, gEnd);
-const FFa = new Function('qSe', 'return ' + gSrc + '; return FFa;')(qSe);
-const base = () => ({
-  config: { titleGeneration: {}, taskType: 'interactive' },
-  sessionStore: {},
-  turnNumber: 0,
-});
+// ---- 7. 守卫逻辑单测 ----
+const guardFactory = new Function('normalizer', 'return ' + S.guardNew.replace(new RegExp('\\b' + S.normalizer + '\\b', 'g'), 'normalizer') + `; return ${S.guardNew.match(/^function ([A-Za-z_$][\w$]*)/)[1]};`);
+const guard = guardFactory(normalizer);
+const base = () => ({ config: { titleGeneration: {}, taskType: 'interactive' }, sessionStore: {}, turnNumber: 0 });
 const guardCases = [
-  ['第 0 轮 长输入', { ...base() }, '帮我重构日志模块并统一输出', true],
-  ['第 0 轮 短输入', { ...base() }, '你好', true],
-  ['第 5 轮 短输入「继续」（是否调用交给 xFa 判断）', { ...base(), turnNumber: 5 }, '继续', true],
-  ['空输入（应跳过）', { ...base() }, '   ', false],
+  ['第 0 轮 长输入', base(), '帮我重构日志模块并统一输出', true],
+  ['第 0 轮 短输入', base(), '你好', true],
+  ['第 5 轮 短输入「继续」（是否调用交给跳过规则判断）', { ...base(), turnNumber: 5 }, '继续', true],
+  ['空输入（应跳过）', base(), '   ', false],
   ['子会话（应跳过）', { ...base(), config: { titleGeneration: {}, taskType: 'interactive', parentSessionId: 'sess_x' } }, '帮我做点事', false],
   ['关闭开关（应跳过）', { ...base(), config: { titleGeneration: { enabled: false }, taskType: 'interactive' } }, '帮我做点事', false],
 ];
 console.log('\n== guard (是否允许尝试) ==');
 let guardOk = true;
-for (const [label, rt, text, want] of guardCases) {
-  const got = FFa(rt, text);
+for (const [label, rt, input, want] of guardCases) {
+  const got = guard(rt, input);
   if (got !== want) guardOk = false;
   console.log('  ' + (got ? 'run ' : 'skip') + '  (want ' + (want ? 'run' : 'skip') + ')  ' + label);
 }
 
-// ---- 7. xFa 内的判断片段（决定要不要调模型、用哪个档位） ----
-const sFrom = src.indexOf('if(t.querySource===aAn){');
-const sEnd = src.indexOf('/*titlepatch*/', sFrom) + '/*titlepatch*/'.length;
-if (sFrom === -1 || sEnd === -1) throw new Error('titlepatch snippet not found in bundle');
-const snippet = src.slice(sFrom, sEnd);
-console.log('\n== xFa snippet ==\n' + snippet + '\n');
+// ---- 8. 跳过规则（插在实现函数体开头的那段） ----
+const snippet = buildSnippet(S);
+console.log('\n== skip rules snippet ==\n' + snippet + '\n');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-const decide = new AsyncFunction(
-  'e',
-  't',
-  'n',
-  'qSe',
-  'aAn',
-  snippet + '; return {decision:"run",level:(n.options||{}).reasoningLevel};',
-);
-const sel = { providerId: 'p', modelId: 'm', options: { reasoningLevel: 'disabled' } };
+const snippetForTest = snippet.replace(new RegExp('\\b' + S.sessionSource + '\\b', 'g'), 'sessionSource');
+const decide = new AsyncFunction('e', 't', 'normalizer', 'sessionSource', snippetForTest + '; return {decision:"run"};');
 const withSession = (titleSource) => ({
   sessionId: 's1',
   sessionStore: { getSession: async () => ({ title: 't', titleSource }) },
@@ -246,13 +243,13 @@ const snippetCases = [
   ['还没标题(first_input) + 短输入 → 补一次', withSession('first_input'), '还是没效果', 'run'],
   ['还没标题(first_input) + 长输入 → 生成', withSession('first_input'), '帮我优化数据同步脚本', 'run'],
 ];
-console.log('== xFa 判断 ==');
+console.log('== skip rules ==');
 let snippetOk = true;
 for (const [label, rt, input, want] of snippetCases) {
-  const out = await decide.call(rt, input, { querySource: 'session_title' }, { ...sel, options: { ...sel.options } }, qSe, 'session_title');
-  const got = out && out.decision === 'run' ? 'run' : 'skip';
+  const out = await decide.call(rt, input, { querySource: S.sessionSource }, normalizer, S.sessionSource);
+  const got = out ? 'run' : 'skip';
   const pass = got === want;
   if (!pass) snippetOk = false;
   console.log('  ' + (pass ? 'ok  ' : 'FAIL') + '  ' + got.padEnd(5) + '(want ' + want + ')  ' + label);
 }
-console.log('\nSUMMARY  guard=' + (guardOk ? 'ok' : 'FAIL') + '  aux=' + (auxOk ? 'ok' : 'FAIL') + '  snippet=' + (snippetOk ? 'ok' : 'FAIL'));
+console.log('\nSUMMARY  guard=' + (guardOk ? 'ok' : 'FAIL') + '  aux=' + (auxOk ? 'ok' : 'FAIL') + '  skip_rules=' + (snippetOk ? 'ok' : 'FAIL'));
